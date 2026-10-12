@@ -1,0 +1,1335 @@
+#usage "en: <b>Export to Blender (.pcb3d)</b><p>"
+       "Exports the current Fusion / EAGLE board as a <i>.pcb3d</i> file that the "
+       "<b>pcb2blender</b> Blender add-on (PCB 3D Importer) can open via "
+       "<i>File &gt; Import &gt; PCB (.pcb3d)</i>. No KiCad needed.<p>"
+       "Exported: board mesh (outline, cutouts, drill holes), copper, solder mask, "
+       "paste and silkscreen layers for both sides, and pad data for solder joints.<br>"
+       "Not exported: component 3D models. Export those from Fusion's 3D PCB as FBX.<p>"
+       "Requirements: macOS or Linux (uses /bin/sh and zip). Run from the PCB editor.<p>"
+       "Format reference: github.com/30350n/pcb2blender (pcb3d exporter)."
+
+// =====================================================================
+//  export-pcb3d.ulp
+//  Recreates the pcb2blender KiCad exporter for Fusion 360 Electronics.
+//
+//  .pcb3d layout (a zip file):
+//    pcb.wrl                 board mesh (VRML, metres, z = +/- thickness/2)
+//    components/             (empty - components come from Fusion as FBX)
+//    layers/F_Cu.svg ...     8 layer SVGs (F/B x Cu, Paste, SilkS, Mask)
+//    layers/bounds.toml      SVG bounds in mm (KiCad coords, y down)
+//    layers/stackup.toml     thickness, mask/silk colour, surface finish
+//    boards/                 (empty - single board)
+//    pads/<name>.toml        one file per pad (used for solder joints)
+// =====================================================================
+
+// ---------------- user settings (set in the dialog) ----------------
+real   gThickness = 1.6;
+int    gMaskSel = 0;
+string gMaskNames[] = { "GREEN", "RED", "BLUE", "PURPLE", "BLACK", "WHITE", "YELLOW" };
+int    gSilkSel = 0;
+string gSilkNames[] = { "WHITE", "BLACK" };
+int    gFinishSel = 0;
+string gFinishNames[] = { "HASL", "ENIG", "NONE" };
+int    gIncludeValues = 0;
+int    gTentVias = 0;
+string gOutPath = "";
+
+// ---------------- constants ----------------
+string TMP        = "/tmp/pcb2blender_fusion_";
+string PACK       = "/tmp/pcb2blender_fusion_pack.sh";
+real   SVG_MARGIN = 1.0;    // mm, same as pcb2blender
+real   CHAIN_TOL  = 0.01;   // mm, outline gap tolerance
+// SMD mask/paste sizes are derived from the copper pad, because Fusion refuses
+// dx[layer] lookups on the "other" side for pads of parts placed on the bottom.
+real   SMD_STOP_MM = 0.1;   // solder mask expansion per side (EAGLE default 4 mil)
+
+// ---------------- misc helpers ----------------
+int near(real x1, real y1, real x2, real y2)
+{
+  if (abs(x1 - x2) > CHAIN_TOL) return 0;
+  if (abs(y1 - y2) > CHAIN_TOL) return 0;
+  return 1;
+}
+
+string sanitized(string s)
+{
+  string r = "";
+  string t;
+  int i;
+  int lastU = 0;
+  char c;
+  for (i = 0; i < strlen(s); i++) {
+    c = s[i];
+    if (isalnum(c)) { sprintf(t, "%c", c); r += t; lastU = 0; }
+    else if (!lastU) { r += "_"; lastU = 1; }
+  }
+  return r;
+}
+
+// single-quote a string for /bin/sh
+string shq(string s)
+{
+  string r = "'";
+  string t;
+  int i;
+  for (i = 0; i < strlen(s); i++) {
+    if (s[i] == '\'') r += "'\\''";
+    else { sprintf(t, "%c", s[i]); r += t; }
+  }
+  return r + "'";
+}
+
+// =====================================================================
+//  1. Board outline: collect polylines on Dimension (20) / Milling (46)
+// =====================================================================
+real PLX[], PLY[];
+int  PL_START[], PL_LEN[], PL_USED[];
+int  plCount = 0, plPts = 0;
+
+void plBegin() { PL_START[plCount] = plPts; PL_LEN[plCount] = 0; PL_USED[plCount] = 0; }
+void plAdd(real x, real y) { PLX[plPts] = x; PLY[plPts] = y; plPts++; PL_LEN[plCount]++; }
+void plEnd()
+{
+  if (PL_LEN[plCount] >= 2) plCount++;
+  else plPts = PL_START[plCount];
+}
+
+// straight wire or arc (curve in degrees, CCW positive) as a polyline
+void plWire(real x1, real y1, real x2, real y2, real curve)
+{
+  real dx, dy, c, a, k, cx, cy, vx, vy, t;
+  int n, i;
+  plBegin();
+  plAdd(x1, y1);
+  if (curve != 0) {
+    dx = x2 - x1; dy = y2 - y1;
+    c = sqrt(dx * dx + dy * dy);
+    if (c > 1e-9) {
+      a = curve * PI / 180.0;
+      k = c / (2.0 * tan(a / 2.0));
+      cx = (x1 + x2) / 2.0 - dy / c * k;
+      cy = (y1 + y2) / 2.0 + dx / c * k;
+      vx = x1 - cx; vy = y1 - cy;
+      n = int(ceil(abs(curve) / 5.0));
+      if (n < 2) n = 2;
+      for (i = 1; i < n; i++) {
+        t = a * i / n;
+        plAdd(cx + vx * cos(t) - vy * sin(t), cy + vx * sin(t) + vy * cos(t));
+      }
+    }
+  }
+  plAdd(x2, y2);
+  plEnd();
+}
+
+void plCircle(real cx, real cy, real r)
+{
+  int n, i;
+  n = int(ceil(r * 2 * PI / 0.5));   // ~0.5 mm segments
+  if (n < 32) n = 32;
+  if (n > 256) n = 256;
+  plBegin();
+  for (i = 0; i < n; i++) plAdd(cx + r * cos(2 * PI * i / n), cy + r * sin(2 * PI * i / n));
+  plAdd(cx + r, cy);
+  plEnd();
+}
+
+void collectOutline()
+{
+  board(B) {
+    B.wires(W) {
+      if (W.layer == 20 || W.layer == 46)
+        plWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve);
+    }
+    B.circles(C) {
+      if (C.layer == 20 || C.layer == 46) plCircle(u2mm(C.x), u2mm(C.y), u2mm(C.radius));
+    }
+    B.elements(E) {
+      E.footprint.wires(W) {
+        if (W.layer == 20 || W.layer == 46)
+          plWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve);
+      }
+      E.footprint.circles(C) {
+        if (C.layer == 20 || C.layer == 46) plCircle(u2mm(C.x), u2mm(C.y), u2mm(C.radius));
+      }
+    }
+  }
+}
+
+// chain polylines into closed loops
+real LX[], LY[];
+int  LOOP_START[], LOOP_LEN[];
+int  loopCount = 0, loopPts = 0, openCount = 0;
+
+void loopPush(real x, real y)
+{
+  if (loopPts > 0) {
+    if (near(x, y, LX[loopPts - 1], LY[loopPts - 1])) return;
+  }
+  LX[loopPts] = x; LY[loopPts] = y; loopPts++;
+}
+
+void chainLoops()
+{
+  int i, j, k, a, b, ls, found, rev, closed;
+  real ex, ey;
+  for (i = 0; i < plCount; i++) {
+    if (PL_USED[i]) continue;
+    PL_USED[i] = 1;
+    ls = loopPts;
+    LX[loopPts] = PLX[PL_START[i]]; LY[loopPts] = PLY[PL_START[i]]; loopPts++;
+    for (k = 1; k < PL_LEN[i]; k++) loopPush(PLX[PL_START[i] + k], PLY[PL_START[i] + k]);
+    closed = 0;
+    while (1) {
+      ex = LX[loopPts - 1]; ey = LY[loopPts - 1];
+      if (loopPts - ls > 2) {
+        if (near(ex, ey, LX[ls], LY[ls])) { closed = 1; break; }
+      }
+      found = -1; rev = 0;
+      for (j = 0; j < plCount; j++) {
+        if (PL_USED[j]) continue;
+        a = PL_START[j]; b = a + PL_LEN[j] - 1;
+        if (near(PLX[a], PLY[a], ex, ey)) { found = j; rev = 0; break; }
+        if (near(PLX[b], PLY[b], ex, ey)) { found = j; rev = 1; break; }
+      }
+      if (found < 0) break;
+      PL_USED[found] = 1;
+      a = PL_START[found];
+      if (!rev) { for (k = 1; k < PL_LEN[found]; k++) loopPush(PLX[a + k], PLY[a + k]); }
+      else      { for (k = PL_LEN[found] - 2; k >= 0; k--) loopPush(PLX[a + k], PLY[a + k]); }
+    }
+    if (closed) {
+      loopPts--;                         // drop duplicated closing point
+      LOOP_START[loopCount] = ls;
+      LOOP_LEN[loopCount] = loopPts - ls;
+      if (LOOP_LEN[loopCount] >= 3) loopCount++;
+      else loopPts = ls;
+    }
+    else { openCount++; loopPts = ls; }
+  }
+}
+
+real loopArea(int l)
+{
+  real s = 0;
+  int i, j, s0, n;
+  s0 = LOOP_START[l]; n = LOOP_LEN[l];
+  for (i = 0; i < n; i++) {
+    j = (i + 1) % n;
+    s += LX[s0 + i] * LY[s0 + j] - LX[s0 + j] * LY[s0 + i];
+  }
+  return s / 2.0;
+}
+
+int pointInLoop(real x, real y, int l)
+{
+  int i, j, s0, n, inside = 0;
+  s0 = LOOP_START[l]; n = LOOP_LEN[l];
+  j = n - 1;
+  for (i = 0; i < n; i++) {
+    if ((LY[s0 + i] > y) != (LY[s0 + j] > y)) {
+      if (x < (LX[s0 + j] - LX[s0 + i]) * (y - LY[s0 + i]) / (LY[s0 + j] - LY[s0 + i]) + LX[s0 + i])
+        inside = !inside;
+    }
+    j = i;
+  }
+  return inside;
+}
+
+// =====================================================================
+//  2. Drill holes (pads, vias, non-plated holes)
+// =====================================================================
+real DRX[], DRY[], DRD[];
+int  drillCount = 0;
+
+void addDrill(real x, real y, real d)
+{
+  int i;
+  if (d <= 0) return;
+  for (i = 0; i < drillCount; i++) {
+    if (abs(DRX[i] - x) < 0.001 && abs(DRY[i] - y) < 0.001) {
+      if (d > DRD[i]) DRD[i] = d;
+      return;
+    }
+  }
+  DRX[drillCount] = x; DRY[drillCount] = y; DRD[drillCount] = d; drillCount++;
+}
+
+void collectDrills()
+{
+  board(B) {
+    B.signals(S) { S.vias(V) addDrill(u2mm(V.x), u2mm(V.y), u2mm(V.drill)); }
+    B.holes(H) addDrill(u2mm(H.x), u2mm(H.y), u2mm(H.drill));
+    B.elements(E) {
+      E.footprint.contacts(C) {
+        if (C.pad) addDrill(u2mm(C.pad.x), u2mm(C.pad.y), u2mm(C.pad.drill));
+      }
+      E.footprint.holes(H) addDrill(u2mm(H.x), u2mm(H.y), u2mm(H.drill));
+    }
+  }
+}
+
+// =====================================================================
+//  3. Mesh rings: ring 0 = outer (CCW), then cutouts and drills (CW)
+// =====================================================================
+real DX[], DY[];
+int  RING_START[], RING_LEN[], RING_WALL[];
+int  ringCount = 0, ptCount = 0;
+
+void addRingFromLoop(int l, int wantCCW)
+{
+  int i, s0, n;
+  int ccw = loopArea(l) > 0;
+  s0 = LOOP_START[l]; n = LOOP_LEN[l];
+  RING_START[ringCount] = ptCount; RING_LEN[ringCount] = n; RING_WALL[ringCount] = 1;
+  for (i = 0; i < n; i++) {
+    if (ccw == wantCCW) { DX[ptCount] = LX[s0 + i]; DY[ptCount] = LY[s0 + i]; }
+    else                { DX[ptCount] = LX[s0 + n - 1 - i]; DY[ptCount] = LY[s0 + n - 1 - i]; }
+    ptCount++;
+  }
+  ringCount++;
+}
+
+void addDrillRing(real x, real y, real d)
+{
+  int n, i;
+  n = int(ceil(d * 16));
+  if (n < 16) n = 16;
+  if (n > 64) n = 64;
+  RING_START[ringCount] = ptCount; RING_LEN[ringCount] = n; RING_WALL[ringCount] = 0;
+  for (i = 0; i < n; i++) {           // clockwise
+    DX[ptCount] = x + d / 2 * cos(-2 * PI * i / n);
+    DY[ptCount] = y + d / 2 * sin(-2 * PI * i / n);
+    ptCount++;
+  }
+  ringCount++;
+}
+
+// =====================================================================
+//  4. Triangulation: port of mapbox/earcut 2.2.4 (ISC licence)
+//     Nodes are parallel arrays, -1 = null. Recursion replaced by a job stack.
+// =====================================================================
+real NX[], NY[];
+int  NI[], NP[], NN[], NZ[], NPZ[], NNZ[], NS[];
+int  nodeCount = 0;
+int  TRI[];
+int  triCount = 0;
+real gMinX = 0, gMinY = 0, gInvSize = 0;
+int  JOBN[], JOBP[];
+int  jobCount = 0;
+int  QH[];
+
+int newNode(int i, real x, real y)
+{
+  int p = nodeCount;
+  nodeCount++;
+  NI[p] = i; NX[p] = x; NY[p] = y;
+  NP[p] = -1; NN[p] = -1; NZ[p] = -1; NPZ[p] = -1; NNZ[p] = -1; NS[p] = 0;
+  return p;
+}
+
+int insertNode(int i, real x, real y, int last)
+{
+  int p = newNode(i, x, y);
+  if (last < 0) { NP[p] = p; NN[p] = p; }
+  else { NN[p] = NN[last]; NP[p] = last; NP[NN[last]] = p; NN[last] = p; }
+  return p;
+}
+
+void removeNode(int p)
+{
+  NP[NN[p]] = NP[p];
+  NN[NP[p]] = NN[p];
+  if (NPZ[p] >= 0) NNZ[NPZ[p]] = NNZ[p];
+  if (NNZ[p] >= 0) NPZ[NNZ[p]] = NPZ[p];
+}
+
+real ecArea(int p, int q, int r)
+{
+  return (NY[q] - NY[p]) * (NX[r] - NX[q]) - (NX[q] - NX[p]) * (NY[r] - NY[q]);
+}
+
+int ecEquals(int a, int b)
+{
+  if (NX[a] != NX[b]) return 0;
+  if (NY[a] != NY[b]) return 0;
+  return 1;
+}
+
+int pointInTri(real ax, real ay, real bx, real by, real cx, real cy, real px, real py)
+{
+  if ((cx - px) * (ay - py) < (ax - px) * (cy - py)) return 0;
+  if ((ax - px) * (by - py) < (bx - px) * (ay - py)) return 0;
+  if ((bx - px) * (cy - py) < (cx - px) * (by - py)) return 0;
+  return 1;
+}
+
+real signedArea(int start, int end)
+{
+  real sum = 0;
+  int i, j;
+  j = end - 1;
+  for (i = start; i < end; i++) { sum += (DX[j] - DX[i]) * (DY[i] + DY[j]); j = i; }
+  return sum;
+}
+
+int linkedList(int start, int end, int clockwise)
+{
+  int i;
+  int last = -1;
+  int pos = signedArea(start, end) > 0;
+  if (clockwise == pos) { for (i = start; i < end; i++) last = insertNode(i, DX[i], DY[i], last); }
+  else                  { for (i = end - 1; i >= start; i--) last = insertNode(i, DX[i], DY[i], last); }
+  if (last >= 0) {
+    if (ecEquals(last, NN[last])) { removeNode(last); last = NN[last]; }
+  }
+  return last;
+}
+
+int filterPoints(int start, int end)
+{
+  int p, again;
+  if (start < 0) return start;
+  if (end < 0) end = start;
+  p = start;
+  do {
+    again = 0;
+    if (!NS[p] && (ecEquals(p, NN[p]) || ecArea(NP[p], p, NN[p]) == 0)) {
+      removeNode(p);
+      p = NP[p]; end = p;
+      if (p == NN[p]) break;
+      again = 1;
+    }
+    else p = NN[p];
+  } while (again || p != end);
+  return end;
+}
+
+int zOrder(real x, real y)
+{
+  int ix = int((x - gMinX) * gInvSize);
+  int iy = int((y - gMinY) * gInvSize);
+  ix = (ix | (ix << 8)) & 16711935;
+  ix = (ix | (ix << 4)) & 252645135;
+  ix = (ix | (ix << 2)) & 858993459;
+  ix = (ix | (ix << 1)) & 1431655765;
+  iy = (iy | (iy << 8)) & 16711935;
+  iy = (iy | (iy << 4)) & 252645135;
+  iy = (iy | (iy << 2)) & 858993459;
+  iy = (iy | (iy << 1)) & 1431655765;
+  return ix | (iy << 1);
+}
+
+int sortLinked(int list)
+{
+  int i, p, q, e, tail, numMerges, pSize, qSize, takeP;
+  int inSize = 1;
+  do {
+    p = list; list = -1; tail = -1; numMerges = 0;
+    while (p >= 0) {
+      numMerges++;
+      q = p; pSize = 0;
+      for (i = 0; i < inSize; i++) { pSize++; q = NNZ[q]; if (q < 0) break; }
+      qSize = inSize;
+      while (pSize > 0 || (qSize > 0 && q >= 0)) {
+        takeP = 0;
+        if (pSize != 0) {
+          if (qSize == 0 || q < 0) takeP = 1;
+          else if (NZ[p] <= NZ[q]) takeP = 1;
+        }
+        if (takeP) { e = p; p = NNZ[p]; pSize--; }
+        else       { e = q; q = NNZ[q]; qSize--; }
+        if (tail >= 0) NNZ[tail] = e; else list = e;
+        NPZ[e] = tail;
+        tail = e;
+      }
+      p = q;
+    }
+    NNZ[tail] = -1;
+    inSize *= 2;
+  } while (numMerges > 1);
+  return list;
+}
+
+void indexCurve(int start)
+{
+  int p = start;
+  do {
+    if (NZ[p] < 0) NZ[p] = zOrder(NX[p], NY[p]);
+    NPZ[p] = NP[p];
+    NNZ[p] = NN[p];
+    p = NN[p];
+  } while (p != start);
+  NNZ[NPZ[p]] = -1;
+  NPZ[p] = -1;
+  sortLinked(p);
+}
+
+int earBlocker(int p, int a, int c, real ax, real ay, real bx, real by, real cx, real cy,
+               real x0, real y0, real x1, real y1)
+{
+  if (p == a || p == c) return 0;
+  if (NX[p] < x0 || NX[p] > x1 || NY[p] < y0 || NY[p] > y1) return 0;
+  if (!pointInTri(ax, ay, bx, by, cx, cy, NX[p], NY[p])) return 0;
+  if (ecArea(NP[p], p, NN[p]) < 0) return 0;
+  return 1;
+}
+
+int isEar(int ear)
+{
+  int a = NP[ear], b = ear, c = NN[ear], p;
+  real x0, y0, x1, y1;
+  if (ecArea(a, b, c) >= 0) return 0;
+  x0 = min(NX[a], min(NX[b], NX[c])); y0 = min(NY[a], min(NY[b], NY[c]));
+  x1 = max(NX[a], max(NX[b], NX[c])); y1 = max(NY[a], max(NY[b], NY[c]));
+  p = NN[c];
+  while (p != a) {
+    if (earBlocker(p, a, c, NX[a], NY[a], NX[b], NY[b], NX[c], NY[c], x0, y0, x1, y1)) return 0;
+    p = NN[p];
+  }
+  return 1;
+}
+
+int isEarHashed(int ear)
+{
+  int a = NP[ear], b = ear, c = NN[ear], p, n, minZ, maxZ;
+  real ax, ay, bx, by, cx, cy, x0, y0, x1, y1;
+  if (ecArea(a, b, c) >= 0) return 0;
+  ax = NX[a]; ay = NY[a]; bx = NX[b]; by = NY[b]; cx = NX[c]; cy = NY[c];
+  x0 = min(ax, min(bx, cx)); y0 = min(ay, min(by, cy));
+  x1 = max(ax, max(bx, cx)); y1 = max(ay, max(by, cy));
+  minZ = zOrder(x0, y0);
+  maxZ = zOrder(x1, y1);
+  p = NPZ[ear]; n = NNZ[ear];
+  while (1) {
+    if (p < 0 || n < 0) break;
+    if (NZ[p] < minZ || NZ[n] > maxZ) break;
+    if (earBlocker(p, a, c, ax, ay, bx, by, cx, cy, x0, y0, x1, y1)) return 0;
+    p = NPZ[p];
+    if (earBlocker(n, a, c, ax, ay, bx, by, cx, cy, x0, y0, x1, y1)) return 0;
+    n = NNZ[n];
+  }
+  while (1) {
+    if (p < 0) break;
+    if (NZ[p] < minZ) break;
+    if (earBlocker(p, a, c, ax, ay, bx, by, cx, cy, x0, y0, x1, y1)) return 0;
+    p = NPZ[p];
+  }
+  while (1) {
+    if (n < 0) break;
+    if (NZ[n] > maxZ) break;
+    if (earBlocker(n, a, c, ax, ay, bx, by, cx, cy, x0, y0, x1, y1)) return 0;
+    n = NNZ[n];
+  }
+  return 1;
+}
+
+int sgn(real v) { if (v > 0) return 1; if (v < 0) return -1; return 0; }
+
+int onSegment(int p, int q, int r)
+{
+  if (NX[q] > max(NX[p], NX[r])) return 0;
+  if (NX[q] < min(NX[p], NX[r])) return 0;
+  if (NY[q] > max(NY[p], NY[r])) return 0;
+  if (NY[q] < min(NY[p], NY[r])) return 0;
+  return 1;
+}
+
+int intersects(int p1, int q1, int p2, int q2)
+{
+  int o1 = sgn(ecArea(p1, q1, p2));
+  int o2 = sgn(ecArea(p1, q1, q2));
+  int o3 = sgn(ecArea(p2, q2, p1));
+  int o4 = sgn(ecArea(p2, q2, q1));
+  if (o1 != o2 && o3 != o4) return 1;
+  if (o1 == 0) { if (onSegment(p1, p2, q1)) return 1; }
+  if (o2 == 0) { if (onSegment(p1, q2, q1)) return 1; }
+  if (o3 == 0) { if (onSegment(p2, p1, q2)) return 1; }
+  if (o4 == 0) { if (onSegment(p2, q1, q2)) return 1; }
+  return 0;
+}
+
+int intersectsPolygon(int a, int b)
+{
+  int p = a;
+  do {
+    if (NI[p] != NI[a] && NI[NN[p]] != NI[a] && NI[p] != NI[b] && NI[NN[p]] != NI[b]) {
+      if (intersects(p, NN[p], a, b)) return 1;
+    }
+    p = NN[p];
+  } while (p != a);
+  return 0;
+}
+
+int locallyInside(int a, int b)
+{
+  if (ecArea(NP[a], a, NN[a]) < 0) {
+    if (ecArea(a, b, NN[a]) >= 0 && ecArea(a, NP[a], b) >= 0) return 1;
+    return 0;
+  }
+  if (ecArea(a, b, NP[a]) < 0 || ecArea(a, NN[a], b) < 0) return 1;
+  return 0;
+}
+
+int middleInside(int a, int b)
+{
+  int p = a, n, inside = 0;
+  real px = (NX[a] + NX[b]) / 2.0, py = (NY[a] + NY[b]) / 2.0;
+  do {
+    n = NN[p];
+    if (((NY[p] > py) != (NY[n] > py)) && NY[n] != NY[p]) {
+      if (px < (NX[n] - NX[p]) * (py - NY[p]) / (NY[n] - NY[p]) + NX[p]) inside = !inside;
+    }
+    p = n;
+  } while (p != a);
+  return inside;
+}
+
+int isValidDiagonal(int a, int b)
+{
+  if (NI[NN[a]] == NI[b]) return 0;
+  if (NI[NP[a]] == NI[b]) return 0;
+  if (intersectsPolygon(a, b)) return 0;
+  if (locallyInside(a, b) && locallyInside(b, a) && middleInside(a, b)) {
+    if (ecArea(NP[a], a, NP[b]) != 0 || ecArea(a, NP[b], b) != 0) return 1;
+  }
+  if (ecEquals(a, b)) {
+    if (ecArea(NP[a], a, NN[a]) > 0 && ecArea(NP[b], b, NN[b]) > 0) return 1;
+  }
+  return 0;
+}
+
+int splitPolygon(int a, int b)
+{
+  int a2 = newNode(NI[a], NX[a], NY[a]);
+  int b2 = newNode(NI[b], NX[b], NY[b]);
+  int an = NN[a], bp = NP[b];
+  NN[a] = b;   NP[b] = a;
+  NN[a2] = an; NP[an] = a2;
+  NN[b2] = a2; NP[a2] = b2;
+  NN[bp] = b2; NP[b2] = bp;
+  return b2;
+}
+
+void addTri(int a, int b, int c)
+{
+  TRI[triCount * 3] = NI[a];
+  TRI[triCount * 3 + 1] = NI[b];
+  TRI[triCount * 3 + 2] = NI[c];
+  triCount++;
+}
+
+void pushJob(int n, int pass) { JOBN[jobCount] = n; JOBP[jobCount] = pass; jobCount++; }
+
+int cureLocalIntersections(int start)
+{
+  int p, a, b;
+  if (start < 0) return -1;
+  p = start;
+  do {
+    a = NP[p]; b = NN[NN[p]];
+    if (!ecEquals(a, b)) {
+      if (intersects(a, p, NN[p], b) && locallyInside(a, b) && locallyInside(b, a)) {
+        addTri(a, p, b);
+        removeNode(p);
+        removeNode(NN[p]);
+        p = b; start = b;
+      }
+    }
+    p = NN[p];
+  } while (p != start);
+  return filterPoints(p, -1);
+}
+
+void splitEarcut(int start)
+{
+  int a = start, b, c;
+  do {
+    b = NN[NN[a]];
+    while (b != NP[a]) {
+      if (NI[a] != NI[b]) {
+        if (isValidDiagonal(a, b)) {
+          c = splitPolygon(a, b);
+          a = filterPoints(a, NN[a]);
+          c = filterPoints(c, NN[c]);
+          pushJob(a, 0);
+          pushJob(c, 0);
+          return;
+        }
+      }
+      b = NN[b];
+    }
+    a = NN[a];
+  } while (a != start);
+}
+
+void runEarcut()
+{
+  int ear, pass, stop, prv, nxt, isE;
+  while (jobCount > 0) {
+    jobCount--;
+    ear = JOBN[jobCount]; pass = JOBP[jobCount];
+    if (ear < 0) continue;
+    if (pass == 0 && gInvSize != 0) indexCurve(ear);
+    stop = ear;
+    while (NP[ear] != NN[ear]) {
+      prv = NP[ear]; nxt = NN[ear];
+      if (gInvSize != 0) isE = isEarHashed(ear); else isE = isEar(ear);
+      if (isE) {
+        addTri(prv, ear, nxt);
+        removeNode(ear);
+        ear = NN[nxt];
+        stop = NN[nxt];
+        continue;
+      }
+      ear = nxt;
+      if (ear == stop) {
+        if (pass == 0) pushJob(filterPoints(ear, -1), 1);
+        else if (pass == 1) pushJob(cureLocalIntersections(filterPoints(ear, -1)), 2);
+        else splitEarcut(ear);
+        break;
+      }
+    }
+  }
+}
+
+int getLeftmost(int start)
+{
+  int p = start, leftmost = start;
+  do {
+    if (NX[p] < NX[leftmost] || (NX[p] == NX[leftmost] && NY[p] < NY[leftmost])) leftmost = p;
+    p = NN[p];
+  } while (p != start);
+  return leftmost;
+}
+
+int sectorContainsSector(int m, int p)
+{
+  if (ecArea(NP[m], m, NP[p]) < 0 && ecArea(NN[p], m, NN[m]) < 0) return 1;
+  return 0;
+}
+
+int findHoleBridge(int hole, int outerNode)
+{
+  int p = outerNode, m = -1, stop;
+  real hx = NX[hole], hy = NY[hole], qx = -1000000000.0, x, mx, my, tn, tanMin;
+  do {
+    if (hy <= NY[p] && hy >= NY[NN[p]] && NY[NN[p]] != NY[p]) {
+      x = NX[p] + (hy - NY[p]) * (NX[NN[p]] - NX[p]) / (NY[NN[p]] - NY[p]);
+      if (x <= hx && x > qx) {
+        qx = x;
+        if (NX[p] < NX[NN[p]]) m = p; else m = NN[p];
+        if (x == hx) return m;
+      }
+    }
+    p = NN[p];
+  } while (p != outerNode);
+  if (m < 0) return -1;
+
+  stop = m; mx = NX[m]; my = NY[m]; tanMin = 1000000000.0;
+  p = m;
+  do {
+    if (hx >= NX[p] && NX[p] >= mx && hx != NX[p]) {
+      if (pointInTri(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx, hy, NX[p], NY[p])) {
+        tn = abs(hy - NY[p]) / (hx - NX[p]);
+        if (locallyInside(p, hole)) {
+          if (tn < tanMin || (tn == tanMin && (NX[p] > NX[m] || (NX[p] == NX[m] && sectorContainsSector(m, p))))) {
+            m = p; tanMin = tn;
+          }
+        }
+      }
+    }
+    p = NN[p];
+  } while (p != stop);
+  return m;
+}
+
+int eliminateHole(int hole, int outerNode)
+{
+  int bridge = findHoleBridge(hole, outerNode);
+  int br;
+  if (bridge < 0) return outerNode;
+  br = splitPolygon(bridge, hole);
+  filterPoints(br, NN[br]);
+  return filterPoints(bridge, NN[bridge]);
+}
+
+int eliminateHoles(int outerNode)
+{
+  int qn = 0, h, start, end, list, i, j, t;
+  string st;
+  for (h = 1; h < ringCount; h++) {
+    start = RING_START[h]; end = start + RING_LEN[h];
+    list = linkedList(start, end, 0);
+    if (list < 0) continue;
+    if (list == NN[list]) NS[list] = 1;
+    QH[qn] = getLeftmost(list); qn++;
+  }
+  for (i = 1; i < qn; i++) {        // sort holes by x (insertion sort)
+    t = QH[i]; j = i - 1;
+    while (j >= 0) {
+      if (NX[QH[j]] <= NX[t]) break;
+      QH[j + 1] = QH[j]; j--;
+    }
+    QH[j + 1] = t;
+  }
+  for (i = 0; i < qn; i++) {
+    if (i % 50 == 0) { sprintf(st, "pcb3d: bridging holes %d / %d", i, qn); status(st); }
+    outerNode = eliminateHole(QH[i], outerNode);
+  }
+  return outerNode;
+}
+
+int triangulate()
+{
+  int outerNode, i;
+  real w, h;
+  outerNode = linkedList(0, RING_LEN[0], 1);
+  if (outerNode < 0) return 0;
+  if (NN[outerNode] == NP[outerNode]) return 0;
+  if (ringCount > 1) outerNode = eliminateHoles(outerNode);
+  gInvSize = 0;
+  if (ptCount > 80) {
+    gMinX = DX[0]; gMinY = DY[0]; w = DX[0]; h = DY[0];
+    for (i = 1; i < RING_LEN[0]; i++) {
+      gMinX = min(gMinX, DX[i]); gMinY = min(gMinY, DY[i]);
+      w = max(w, DX[i]); h = max(h, DY[i]);
+    }
+    gInvSize = max(w - gMinX, h - gMinY);
+    if (gInvSize != 0) gInvSize = 32767.0 / gInvSize;
+  }
+  status("pcb3d: triangulating board");
+  pushJob(outerNode, 0);
+  runEarcut();
+  return triCount;
+}
+
+// =====================================================================
+//  5. SVG layer output
+// =====================================================================
+real gBX, gBY, gBW, gBH;   // SVG bounds, KiCad coords (mm, y down)
+int  LSET[];               // layer number -> include flag
+
+void clearLayerSet() { int i; for (i = 0; i < 256; i++) LSET[i] = 0; }
+
+string arcTo(real x1, real y1, real x2, real y2, real curve)
+{
+  string s;
+  real c, sa, r;
+  int large, sweep;
+  c = sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+  sa = sin(abs(curve) * PI / 360.0);
+  if (sa < 1e-9 || curve == 0) { sprintf(s, "L %.4f %.4f ", x2, -y2); return s; }
+  r = c / (2.0 * sa);
+  large = 0; if (abs(curve) > 180) large = 1;
+  sweep = 1; if (curve > 0) sweep = 0;     // EAGLE CCW -> SVG sweep 0 (y flipped)
+  sprintf(s, "A %.4f %.4f 0 %d %d %.4f %.4f ", r, r, large, sweep, x2, -y2);
+  return s;
+}
+
+void svgWire(real x1, real y1, real x2, real y2, real w, real curve)
+{
+  if (w < 0.02) w = 0.02;
+  printf("<path d=\"M %.4f %.4f %s\" fill=\"none\" stroke-width=\"%.4f\"/>\n",
+         x1, -y1, arcTo(x1, y1, x2, y2, curve), w);
+}
+
+void svgCircle(real x, real y, real r, real w)
+{
+  if (w <= 0) printf("<circle cx=\"%.4f\" cy=\"%.4f\" r=\"%.4f\" stroke=\"none\"/>\n", x, -y, r);
+  else printf("<circle cx=\"%.4f\" cy=\"%.4f\" r=\"%.4f\" fill=\"none\" stroke-width=\"%.4f\"/>\n", x, -y, r, w);
+}
+
+// kind: 0 circle, 1 (rounded) rect, 2 octagon. ox = local x offset (offset pads)
+void svgShape(real x, real y, real w, real h, real ang, int kind, real rr, real ox)
+{
+  real c, a, b;
+  if (w <= 0 || h <= 0) return;
+  printf("<g transform=\"translate(%.4f %.4f) rotate(%.4f)\">", x, -y, -ang);
+  if (kind == 0) printf("<circle cx=\"%.4f\" cy=\"0\" r=\"%.4f\" stroke=\"none\"/>", ox, w / 2);
+  else if (kind == 1)
+    printf("<rect x=\"%.4f\" y=\"%.4f\" width=\"%.4f\" height=\"%.4f\" rx=\"%.4f\" ry=\"%.4f\" stroke=\"none\"/>",
+           ox - w / 2, -h / 2, w, h, rr, rr);
+  else {
+    c = min(w, h) * 0.29289; a = w / 2; b = h / 2;
+    printf("<polygon points=\"%.4f,%.4f %.4f,%.4f %.4f,%.4f %.4f,%.4f %.4f,%.4f %.4f,%.4f %.4f,%.4f %.4f,%.4f\" stroke=\"none\"/>",
+           -a + c, -b, a - c, -b, a, -b + c, a, b - c, a - c, b, -a + c, b, -a, b - c, -a, -b + c);
+  }
+  printf("</g>\n");
+}
+
+void svgEaglePad(real x, real y, real d, int shape, real elong, real ang)
+{
+  real L = d * (1 + elong / 100.0);
+  if      (shape == PAD_SHAPE_SQUARE)  svgShape(x, y, d, d, ang, 1, 0, 0);
+  else if (shape == PAD_SHAPE_OCTAGON) svgShape(x, y, d, d, ang, 2, 0, 0);
+  else if (shape == PAD_SHAPE_LONG)    svgShape(x, y, L, d, ang, 1, d / 2, 0);
+  else if (shape == PAD_SHAPE_OFFSET)  svgShape(x, y, L, d, ang, 1, d / 2, (L - d) / 2);
+  else                                 svgShape(x, y, d, d, ang, 0, 0, 0);
+}
+
+void svgVia(real x, real y, real d, int shape)
+{
+  if      (shape == VIA_SHAPE_SQUARE)  svgShape(x, y, d, d, 0, 1, 0, 0);
+  else if (shape == VIA_SHAPE_OCTAGON) svgShape(x, y, d, d, 0, 2, 0, 0);
+  else                                 svgShape(x, y, d, d, 0, 0, 0, 0);
+}
+
+void svgSmd(real x, real y, real dx, real dy, int roundness, real ang)
+{
+  svgShape(x, y, dx, dy, ang, 1, roundness / 100.0 * min(dx, dy) / 2.0, 0);
+}
+
+// filled path builder (polygons)
+string gPath = "";
+real   gPEX, gPEY;
+int    gPHas = 0;
+
+void pathSeg(real x1, real y1, real x2, real y2, real curve)
+{
+  string s;
+  real t;
+  if (gPHas && !near(x1, y1, gPEX, gPEY) && near(x2, y2, gPEX, gPEY)) {
+    t = x1; x1 = x2; x2 = t; t = y1; y1 = y2; y2 = t; curve = -curve;
+  }
+  if (!gPHas || !near(x1, y1, gPEX, gPEY)) {
+    if (gPHas) gPath += "Z ";
+    sprintf(s, "M %.4f %.4f ", x1, -y1);
+    gPath += s;
+  }
+  gPath += arcTo(x1, y1, x2, y2, curve);
+  gPEX = x2; gPEY = y2; gPHas = 1;
+}
+
+void pathFlush(real strokeW)
+{
+  if (!gPHas) return;
+  gPath += "Z";
+  if (strokeW > 0) printf("<path d=\"%s\" fill-rule=\"evenodd\" stroke-width=\"%.4f\"/>\n", gPath, strokeW);
+  else             printf("<path d=\"%s\" fill-rule=\"evenodd\" stroke=\"none\"/>\n", gPath);
+  gPath = ""; gPHas = 0;
+}
+
+// lines, arcs, circles, rectangles, polygons and texts on the layers in LSET
+void svgGraphics()
+{
+  real pw;
+  int pc;
+  board(B) {
+    B.wires(W) { if (LSET[W.layer]) svgWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), u2mm(W.width), W.curve); }
+    B.circles(C) { if (LSET[C.layer]) svgCircle(u2mm(C.x), u2mm(C.y), u2mm(C.radius), u2mm(C.width)); }
+    B.rectangles(R) {
+      if (LSET[R.layer])
+        svgShape((u2mm(R.x1) + u2mm(R.x2)) / 2, (u2mm(R.y1) + u2mm(R.y2)) / 2,
+                 abs(u2mm(R.x2) - u2mm(R.x1)), abs(u2mm(R.y2) - u2mm(R.y1)), R.angle, 1, 0, 0);
+    }
+    // filled shapes (Fusion replaced 'polygons' with polyShapes / polyPours / polyCutouts)
+    B.polyShapes(P) {
+      if (LSET[P.layer]) {
+        pc = 0; pw = 0;
+        P.contours(W) { if (pc == 0) pw = u2mm(W.width); pc++; }
+        if (pc > 0) { P.contours(W) pathSeg(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve); }
+        else        { P.wires(W) { pw = u2mm(W.width); pathSeg(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve); } }
+        pathFlush(pw);
+      }
+    }
+    B.texts(T) {
+      if (LSET[T.layer]) { T.wires(W) svgWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), u2mm(W.width), W.curve); }
+    }
+    B.elements(E) {
+      E.footprint.wires(W) { if (LSET[W.layer]) svgWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), u2mm(W.width), W.curve); }
+      E.footprint.circles(C) { if (LSET[C.layer]) svgCircle(u2mm(C.x), u2mm(C.y), u2mm(C.radius), u2mm(C.width)); }
+      E.footprint.rectangles(R) {
+        if (LSET[R.layer])
+          svgShape((u2mm(R.x1) + u2mm(R.x2)) / 2, (u2mm(R.y1) + u2mm(R.y2)) / 2,
+                   abs(u2mm(R.x2) - u2mm(R.x1)), abs(u2mm(R.y2) - u2mm(R.y1)), R.angle, 1, 0, 0);
+      }
+      E.footprint.polyShapes(P) {
+        if (LSET[P.layer]) {
+          pc = 0; pw = 0;
+          P.contours(W) { if (pc == 0) pw = u2mm(W.width); pc++; }
+          if (pc > 0) { P.contours(W) pathSeg(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve); }
+          else        { P.wires(W) { pw = u2mm(W.width); pathSeg(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve); } }
+          pathFlush(pw);
+        }
+      }
+      E.footprint.texts(T) {
+        if (LSET[T.layer]) { T.wires(W) svgWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), u2mm(W.width), W.curve); }
+      }
+      E.texts(T) {
+        if (LSET[T.layer]) { T.wires(W) svgWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), u2mm(W.width), W.curve); }
+      }
+    }
+  }
+}
+
+// side an SMD is really on. EAGLE reports layer 16 for SMDs of mirrored (bottom)
+// parts, but some Fusion builds report the library layer (1), so also check E.mirror.
+int smdSide(int reportedLayer, int mirrored)
+{
+  if (reportedLayer == 16) return 16;
+  if (mirrored) return 16;
+  return 1;
+}
+
+// side: 0 = top (F_), 1 = bottom (B_); kind: 0 Cu, 1 Paste, 2 SilkS, 3 Mask
+void writeLayer(int side, int kind, string file)
+{
+  int cu = 1, stop = 29, cream = 31, cnt;
+  int rcu;
+  real d;
+  if (side) { cu = 16; stop = 30; cream = 32; }
+
+  clearLayerSet();
+  if (kind == 0) LSET[cu] = 1;
+  if (kind == 1) LSET[cream] = 1;
+  if (kind == 3) LSET[stop] = 1;
+  if (kind == 2) {
+    if (!side) { LSET[21] = 1; LSET[25] = 1; if (gIncludeValues) LSET[27] = 1; }
+    else       { LSET[22] = 1; LSET[26] = 1; if (gIncludeValues) LSET[28] = 1; }
+  }
+
+  output(file, "wt") {
+    printf("<?xml version=\"1.0\" standalone=\"no\"?>\n");
+    printf("<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"%.6fmm\" height=\"%.6fmm\" viewBox=\"%.6f %.6f %.6f %.6f\">\n",
+           gBW, gBH, gBX, gBY, gBW, gBH);
+    printf("<g fill=\"#000000\" stroke=\"#000000\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\n");
+
+    svgGraphics();
+
+    board(B) {
+      if (kind == 0) {           // ---- copper ----
+        B.signals(S) {
+          S.wires(W) { if (W.layer == cu) svgWire(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), u2mm(W.width), W.curve); }
+          S.polyPours(P) {
+            if (P.layer == cu) {
+              cnt = 0;
+              P.contours(W) cnt++;
+              if (cnt > 0) { P.contours(W) pathSeg(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve); }
+              else         { P.wires(W)    pathSeg(u2mm(W.x1), u2mm(W.y1), u2mm(W.x2), u2mm(W.y2), W.curve); }
+              pathFlush(u2mm(P.width));
+            }
+          }
+          S.vias(V) {
+            if ((!side && V.start == 1) || (side && V.end == 16))
+              svgVia(u2mm(V.x), u2mm(V.y), u2mm(V.diameter[cu]), V.shape[cu]);
+          }
+        }
+        B.elements(E) {
+          E.footprint.contacts(C) {
+            if (C.pad)
+              svgEaglePad(u2mm(C.pad.x), u2mm(C.pad.y), u2mm(C.pad.diameter[cu]), C.pad.shape[cu], C.pad.elongation, C.pad.angle);
+            if (C.smd) {
+              rcu = smdSide(C.smd.layer, E.mirror);
+              if (rcu == cu)
+                svgSmd(u2mm(C.smd.x), u2mm(C.smd.y), u2mm(C.smd.dx), u2mm(C.smd.dy), C.smd.roundness, C.smd.angle);
+            }
+          }
+        }
+      }
+      if (kind == 3) {           // ---- solder mask openings ----
+        if (!gTentVias) {
+          B.signals(S) {
+            S.vias(V) {
+              if ((!side && V.start == 1) || (side && V.end == 16)) {
+                d = u2mm(V.diameter[stop]);
+                if (d > 0) svgVia(u2mm(V.x), u2mm(V.y), d, V.shape[cu]);
+              }
+            }
+          }
+        }
+        B.holes(H) { d = u2mm(H.diameter[stop]); if (d > 0) svgCircle(u2mm(H.x), u2mm(H.y), d / 2, 0); }
+        B.elements(E) {
+          E.footprint.holes(H) { d = u2mm(H.diameter[stop]); if (d > 0) svgCircle(u2mm(H.x), u2mm(H.y), d / 2, 0); }
+          E.footprint.contacts(C) {
+            if (C.pad) {
+              if (C.pad.flags & PAD_FLAG_STOP)
+                svgEaglePad(u2mm(C.pad.x), u2mm(C.pad.y), u2mm(C.pad.diameter[stop]), C.pad.shape[stop], C.pad.elongation, C.pad.angle);
+            }
+            if (C.smd) {
+              rcu = smdSide(C.smd.layer, E.mirror);
+              if (rcu == cu && (C.smd.flags & SMD_FLAG_STOP))
+                svgSmd(u2mm(C.smd.x), u2mm(C.smd.y), u2mm(C.smd.dx) + 2 * SMD_STOP_MM, u2mm(C.smd.dy) + 2 * SMD_STOP_MM, C.smd.roundness, C.smd.angle);
+            }
+          }
+        }
+      }
+      if (kind == 1) {           // ---- paste ----
+        B.elements(E) {
+          E.footprint.contacts(C) {
+            if (C.smd) {
+              rcu = smdSide(C.smd.layer, E.mirror);
+              if (rcu == cu && (C.smd.flags & SMD_FLAG_CREAM))
+                svgSmd(u2mm(C.smd.x), u2mm(C.smd.y), u2mm(C.smd.dx), u2mm(C.smd.dy), C.smd.roundness, C.smd.angle);
+            }
+          }
+        }
+      }
+    }
+    printf("</g>\n</svg>\n");
+  }
+}
+
+// =====================================================================
+//  6. Pads (pads/<name>.toml) - positions in KiCad coords (y down)
+// =====================================================================
+string PADNAMES[];
+int    padCount = 0;
+
+void writePadToml(string name, real x, real y, int flipped, int hasPaste, string ptype,
+                  string shape, real w, real h, real angDeg, real roundness, real drill)
+{
+  output(TMP + "pad_" + name + ".toml", "wt") {
+    printf("position = [ %.6f, %.6f ]\n", x, -y);
+    printf("is_flipped = %s\n", flipped ? "true" : "false");
+    printf("has_model = true\n");
+    printf("is_tht_or_smd = true\n");
+    printf("has_paste = %s\n", hasPaste ? "true" : "false");
+    printf("pad_type = \"%s\"\n", ptype);
+    printf("shape = \"%s\"\n", shape);
+    printf("size = [ %.6f, %.6f ]\n", w, h);
+    printf("rotation = %.6f\n", angDeg * PI / 180.0);
+    printf("roundness = %.6f\n", roundness);
+    printf("drill_shape = \"CIRCULAR\"\n");
+    printf("drill_size = [ %.6f, %.6f ]\n", drill, drill);
+    printf("fab_type = \"NONE\"\n");
+  }
+  PADNAMES[padCount] = name;
+  padCount++;
+}
+
+void writePads()
+{
+  int i = 0, j, sh;
+  string name, shape;
+  real d, L;
+  board(B) {
+    B.elements(E) {
+      j = 0;
+      E.footprint.contacts(C) {
+        sprintf(name, "%s_%s_%d_%d", E.value, E.name, i, j);
+        name = sanitized(name);
+        if (C.pad) {
+          d = u2mm(C.pad.diameter[1]);
+          sh = C.pad.shape[1];
+          L = d;
+          shape = "CIRCLE";
+          if (sh == PAD_SHAPE_SQUARE) shape = "RECT";
+          if (sh == PAD_SHAPE_OCTAGON) shape = "ROUNDRECT";
+          if (sh == PAD_SHAPE_LONG || sh == PAD_SHAPE_OFFSET) { shape = "OVAL"; L = d * (1 + C.pad.elongation / 100.0); }
+          writePadToml(name, u2mm(C.pad.x), u2mm(C.pad.y), E.mirror, 0, "THT", shape,
+                       L, d, C.pad.angle, sh == PAD_SHAPE_OCTAGON ? 0.25 : 0.0, u2mm(C.pad.drill));
+        }
+        if (C.smd) {
+          shape = "RECT";
+          if (C.smd.roundness > 0) shape = "ROUNDRECT";
+          writePadToml(name, u2mm(C.smd.x), u2mm(C.smd.y), smdSide(C.smd.layer, E.mirror) == 16,
+                       (C.smd.flags & SMD_FLAG_CREAM) ? 1 : 0, "SMD", shape,
+                       u2mm(C.smd.dx), u2mm(C.smd.dy), C.smd.angle, C.smd.roundness / 200.0, 0.0);
+        }
+        j++;
+      }
+      i++;
+    }
+  }
+}
+
+// =====================================================================
+//  7. Board mesh (pcb.wrl)
+// =====================================================================
+void writeWrl()
+{
+  int i, t, r, s0, n, k, a, b, c;
+  real zt = gThickness / 2.0 * 0.001, cr;
+  output(TMP + "pcb.wrl", "wt") {
+    printf("#VRML V2.0 utf8\n");
+    printf("Shape {\n  appearance Appearance { material Material { diffuseColor 0.12 0.32 0.12 } }\n");
+    printf("  geometry IndexedFaceSet {\n    solid FALSE\n    coord Coordinate { point [\n");
+    for (i = 0; i < ptCount; i++) printf("%.7f %.7f %.7f,\n", DX[i] * 0.001, DY[i] * 0.001, zt);
+    for (i = 0; i < ptCount; i++) printf("%.7f %.7f %.7f,\n", DX[i] * 0.001, DY[i] * 0.001, -zt);
+    printf("    ] }\n    coordIndex [\n");
+    for (t = 0; t < triCount; t++) {
+      a = TRI[t * 3]; b = TRI[t * 3 + 1]; c = TRI[t * 3 + 2];
+      cr = (DX[b] - DX[a]) * (DY[c] - DY[a]) - (DY[b] - DY[a]) * (DX[c] - DX[a]);
+      if (cr < 0) { k = b; b = c; c = k; }                 // top faces CCW (+z)
+      printf("%d,%d,%d,-1,\n", a, b, c);
+      printf("%d,%d,%d,-1,\n", ptCount + a, ptCount + c, ptCount + b);
+    }
+    for (r = 0; r < ringCount; r++) {                       // outline + cutout walls
+      if (!RING_WALL[r]) continue;                          // drill walls are added by the importer
+      s0 = RING_START[r]; n = RING_LEN[r];
+      for (i = 0; i < n; i++) {
+        a = s0 + i; b = s0 + (i + 1) % n;
+        printf("%d,%d,%d,%d,-1,\n", a, ptCount + a, ptCount + b, b);
+      }
+    }
+    printf("    ]\n  }\n}\n");
+  }
+}
+
+// =====================================================================
+//  main
+// =====================================================================
+if (!board) {
+  dlgMessageBox(":Please run this ULP from the PCB (board) editor.");
+  exit(1);
+}
+
+board(B) gOutPath = filesetext(B.name, ".pcb3d");
+
+int dlgResult = dlgDialog("Export to Blender (.pcb3d)") {
+  dlgGroup("Board") {
+    dlgHBoxLayout { dlgLabel("Thickness (mm)"); dlgRealEdit(gThickness, 0.2, 6.0); dlgStretch(1); }
+    dlgHBoxLayout { dlgLabel("Solder mask"); dlgComboBox(gMaskNames, gMaskSel); dlgStretch(1); }
+    dlgHBoxLayout { dlgLabel("Silkscreen"); dlgComboBox(gSilkNames, gSilkSel); dlgStretch(1); }
+    dlgHBoxLayout { dlgLabel("Surface finish"); dlgComboBox(gFinishNames, gFinishSel); dlgStretch(1); }
+    dlgCheckBox("Print part values on silkscreen (tValues / bValues)", gIncludeValues);
+    dlgCheckBox("Tent all vias (cover vias with solder mask)", gTentVias);
+  }
+  dlgGroup("Output") {
+    dlgHBoxLayout {
+      dlgStringEdit(gOutPath);
+      dlgPushButton("Browse...") {
+        string s = dlgFileSave("Save .pcb3d", gOutPath, "pcb3d files (*.pcb3d)");
+        if (s) gOutPath = s;
+      }
+    }
+  }
+  dlgHBoxLayout {
+    dlgStretch(1);
+    dlgPushButton("+Export") dlgAccept();
+    dlgPushButton("-Cancel") dlgReject();
+  }
+};
+if (!dlgResult) exit(0);
+if (fileext(gOutPath) != ".pcb3d") gOutPath += ".pcb3d";
+
+// ---- outline ----
+status("pcb3d: reading board outline");
+collectOutline();
+chainLoops();
+if (loopCount == 0) {
+  dlgMessageBox(":No closed board outline found on the Dimension layer (20).\n"
+                "Make sure the board outline is a closed shape.");
+  exit(1);
+}
+
+int outer = 0, l;
+for (l = 1; l < loopCount; l++) if (abs(loopArea(l)) > abs(loopArea(outer))) outer = l;
+addRingFromLoop(outer, 1);
+
+int ignoredLoops = 0;
+for (l = 0; l < loopCount; l++) {
+  if (l == outer) continue;
+  if (pointInLoop(LX[LOOP_START[l]], LY[LOOP_START[l]], outer)) addRingFromLoop(l, 0);
+  else ignoredLoops++;
+}
+
+// SVG bounds from the outer outline (KiCad coords: y down)
+real minX = LX[LOOP_START[outer]], maxX = minX, minY = LY[LOOP_START[outer]], maxY = minY;
+for (l = LOOP_START[outer]; l < LOOP_START[outer] + LOOP_LEN[outer]; l++) {
+  minX = min(minX, LX[l]); maxX = max(maxX, LX[l]);
+  minY = min(minY, LY[l]); maxY = max(maxY, LY[l]);
+}
+gBX = minX - SVG_MARGIN;
+gBY = -maxY - SVG_MARGIN;
+gBW = (maxX - minX) + 2 * SVG_MARGIN;
+gBH = (maxY - minY) + 2 * SVG_MARGIN;
+
+// ---- drills ----
+status("pcb3d: collecting drills");
+collectDrills();
+int dr, rr, okDrill, skippedDrills = 0;
+for (dr = 0; dr < drillCount; dr++) {
+  okDrill = pointInLoop(DRX[dr], DRY[dr], outer);
+  for (l = 0; l < loopCount; l++) {
+    if (l != outer && pointInLoop(DRX[dr], DRY[dr], l)) okDrill = 0;
+  }
+  if (okDrill) addDrillRing(DRX[dr], DRY[dr], DRD[dr]);
+  else skippedDrills++;
+}
+
+// ---- mesh ----
+if (triangulate() == 0) {
+  dlgMessageBox(":Triangulating the board outline failed.\n"
+                "Check that the outline on layer 20 is a single closed shape without overlaps.");
+  exit(1);
+}
+status("pcb3d: writing board mesh");
+writeWrl();
+
+// ---- layers ----
+string sides[] = { "F_", "B_" };
+string kinds[] = { "Cu", "Paste", "SilkS", "Mask" };
+int sd, kd;
+for (sd = 0; sd < 2; sd++) {
+  for (kd = 0; kd < 4; kd++) {
+    status("pcb3d: writing " + sides[sd] + kinds[kd]);
+    writeLayer(sd, kd, TMP + sides[sd] + kinds[kd] + ".svg");
+  }
+}
+
+output(TMP + "bounds.toml", "wt") {
+  printf("top_left = [ %.6f, %.6f ]\n", gBX, gBY);
+  printf("size = [ %.6f, %.6f ]\n", gBW, gBH);
+}
+output(TMP + "stackup.toml", "wt") {
+  printf("thickness_mm = %.6f\n", gThickness);
+  printf("mask_color = \"%s\"\n", gMaskNames[gMaskSel]);
+  printf("mask_color_custom = [ 0.0, 0.0, 0.0 ]\n");
+  printf("silks_color = \"%s\"\n", gSilkNames[gSilkSel]);
+  printf("silks_color_custom = [ 0.0, 0.0, 0.0 ]\n");
+  printf("surface_finish = \"%s\"\n", gFinishNames[gFinishSel]);
+}
+
+// ---- pads ----
+status("pcb3d: writing pads");
+writePads();
+
+// ---- pack into a zip with /bin/sh + zip ----
+int p;
+output(PACK, "wt") {
+  printf("#!/bin/sh\n");
+  printf("T=%s\n", shq(TMP));
+  printf("W=/tmp/pcb2blender_fusion_build\n");
+  printf("OUT=%s\n", shq(gOutPath));
+  printf("rm -rf \"$W\"\n");
+  printf("mkdir -p \"$W/components\" \"$W/layers\" \"$W/boards\" \"$W/pads\" || exit 1\n");
+  printf("mv \"${T}pcb.wrl\" \"$W/pcb.wrl\" || exit 1\n");
+  for (sd = 0; sd < 2; sd++)
+    for (kd = 0; kd < 4; kd++)
+      printf("mv \"${T}%s%s.svg\" \"$W/layers/%s%s.svg\" || exit 1\n", sides[sd], kinds[kd], sides[sd], kinds[kd]);
+  printf("mv \"${T}bounds.toml\" \"$W/layers/bounds.toml\" || exit 1\n");
+  printf("mv \"${T}stackup.toml\" \"$W/layers/stackup.toml\" || exit 1\n");
+  for (p = 0; p < padCount; p++)
+    printf("mv \"${T}pad_%s.toml\" \"$W/pads/%s.toml\"\n", PADNAMES[p], PADNAMES[p]);
+  printf("rm -f \"$OUT\"\n");
+  printf("cd \"$W\" && zip -q -r -X \"$OUT\" pcb.wrl components layers boards pads || exit 2\n");
+  printf("cd /tmp && rm -rf \"$W\"\n");
+  printf("rm -f \"${T}\"pad_*.toml\n");
+  printf("exit 0\n");
+}
+
+status("pcb3d: packing");
+int rc = system("/bin/sh " + PACK);
+string found[];
+int ok = fileglob(found, gOutPath);
+
+string report, warn;
+sprintf(report, "Board: %d outline points, %d cutouts, %d drill holes, %d triangles, %d pads.",
+        RING_LEN[0], loopCount - 1 - ignoredLoops, drillCount - skippedDrills, triCount, padCount);
+if (openCount > 0 || ignoredLoops > 0 || skippedDrills > 0) {
+  sprintf(warn, "\n\nWarnings: %d open outline segment chain(s), %d outline loop(s) outside the board, %d drill(s) outside the board were ignored.",
+          openCount, ignoredLoops, skippedDrills);
+  report += warn;
+}
+
+if (ok > 0 && rc == 0) {
+  dlgMessageBox(";Exported:\n" + gOutPath + "\n\n" + report +
+                "\n\nIn Blender: File > Import > PCB (.pcb3d).");
+}
+else {
+  dlgMessageBox("!The layer files were written but could not be packed automatically.\n\n"
+                "Open Terminal and run:\n  sh " + PACK + "\n\n" + report);
+}
+exit(0);

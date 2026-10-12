@@ -1,0 +1,11 @@
+{
+  "autodeskProduct": "Fusion",
+  "type": "script",
+  "author": "Engineering Lab",
+  "description": {
+    "": "Adds the 3D PCB component models to a .pcb3d exported by export-pcb3d.ulp, for the pcb2blender Blender importer."
+  },
+  "version": "1.0.0",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
