@@ -26,6 +26,10 @@
 real   gThickness = 1.6;
 int    gMaskSel = 0;
 string gMaskNames[] = { "GREEN", "RED", "BLUE", "PURPLE", "BLACK", "WHITE", "YELLOW" };
+// board colour in Blender's Solid viewport (same order); renders use stackup.toml
+real   vr[] = { 0.12, 0.45, 0.05, 0.20, 0.02, 0.80, 0.60 };
+real   vg[] = { 0.32, 0.06, 0.12, 0.08, 0.02, 0.80, 0.55 };
+real   vb[] = { 0.12, 0.05, 0.35, 0.35, 0.02, 0.78, 0.10 };
 int    gSilkSel = 0;
 string gSilkNames[] = { "WHITE", "BLACK" };
 int    gFinishSel = 0;
@@ -1143,7 +1147,8 @@ void writeWrl()
   real zt = gThickness / 2.0 * 0.001, cr;
   output(TMP + "pcb.wrl", "wt") {
     printf("#VRML V2.0 utf8\n");
-    printf("Shape {\n  appearance Appearance { material Material { diffuseColor 0.12 0.32 0.12 } }\n");
+    printf("Shape {\n  appearance Appearance { material Material { diffuseColor %.2f %.2f %.2f } }\n",
+           vr[gMaskSel], vg[gMaskSel], vb[gMaskSel]);
     printf("  geometry IndexedFaceSet {\n    solid FALSE\n    coord Coordinate { point [\n");
     for (i = 0; i < ptCount; i++) printf("%.7f %.7f %.7f,\n", DX[i] * 0.001, DY[i] * 0.001, zt);
     for (i = 0; i < ptCount; i++) printf("%.7f %.7f %.7f,\n", DX[i] * 0.001, DY[i] * 0.001, -zt);

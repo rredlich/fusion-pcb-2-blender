@@ -269,7 +269,11 @@ def run(context):
         # ---- find the board body and the axis mapping ----
         root = design.rootComponent
         bodies = list(iter_bodies(root))
-        best = None
+        # Fusion's 3D PCB also contains thin copper / mask / silkscreen bodies with
+        # the same outline as the board, so among the bodies that match the outline
+        # pick the one whose thickness is closest to the stackup thickness.
+        best = None          # closest outline match (for the error message)
+        board = None         # (thickness error, body, fmap, lo, hi, occurrence)
         for occ, body in bodies:
             bb = bbox_mm(body)
             ext = [bb[1][i] - bb[0][i] for i in range(3)]
@@ -281,8 +285,12 @@ def run(context):
             score = abs((hi[0] - lo[0]) - width) + abs((hi[1] - lo[1]) - height)
             if best is None or score < best[0]:
                 best = (score, body, fmap, lo, hi)
+            if score <= 2 * SIZE_TOLERANCE_MM:
+                terr = abs((hi[2] - lo[2]) - thickness)
+                if board is None or terr < board[0]:
+                    board = (terr, body, fmap, lo, hi, occ)
 
-        if best is None or best[0] > 2 * SIZE_TOLERANCE_MM:
+        if board is None:
             found = ""
             if best is not None:
                 found = "\nClosest body: %.2f x %.2f mm." % (best[4][0] - best[3][0], best[4][1] - best[3][1])
@@ -294,7 +302,8 @@ def run(context):
                 % (width, height, found))
             return
 
-        _, board_body, fmap, b_lo, b_hi = best
+        _, board_body, fmap, b_lo, b_hi, board_occ = board
+        board_key = board_occ.fullPathName if board_occ is not None else "root"
         offset = (min_x - b_lo[0], min_y - b_lo[1], -(b_lo[2] + b_hi[2]) / 2.0)
         board_thickness = b_hi[2] - b_lo[2]
         b_w, b_h = b_hi[0] - b_lo[0], b_hi[1] - b_lo[1]
@@ -306,13 +315,22 @@ def run(context):
         for occ, body in bodies:
             if body == board_body:
                 continue
-            lo, hi = mapped_bbox(bbox_mm(body), fmap)
-            in_slab = lo[2] >= b_lo[2] - 0.05 and hi[2] <= b_hi[2] + 0.05
-            board_sized = (hi[0] - lo[0]) > 0.5 * b_w and (hi[1] - lo[1]) > 0.5 * b_h
-            if in_slab and board_sized:      # copper / mask / silk layer bodies
+            key = occ.fullPathName if occ is not None else "root"
+            # Fusion keeps its copper / soldermask / silkscreen bodies in the same
+            # component as the board body; every real part is its own occurrence
+            if key == board_key:
                 skipped_layers += 1
                 continue
-            key = occ.fullPathName if occ is not None else "root"
+            name = body.name.lower()
+            if any(w in name for w in ("soldermask", "solder mask", "silkscreen", "copper", "paste")):
+                skipped_layers += 1
+                continue
+            lo, hi = mapped_bbox(bbox_mm(body), fmap)
+            near = lo[2] >= b_lo[2] - 0.3 and hi[2] <= b_hi[2] + 0.3
+            board_sized = (hi[0] - lo[0]) > 0.5 * b_w and (hi[1] - lo[1]) > 0.5 * b_h
+            if near and board_sized:         # board-sized layer bodies stored elsewhere
+                skipped_layers += 1
+                continue
             if key not in groups:
                 groups[key] = (occ, [])
                 order.append(key)
