@@ -138,6 +138,27 @@ void plCircle(real cx, real cy, real r)
   plEnd();
 }
 
+// rectangle (optionally rotated about its centre) as a closed polyline
+void plRectCorner(real cx, real cy, real lx, real ly, real c, real s)
+{
+  plAdd(cx + lx * c - ly * s, cy + lx * s + ly * c);
+}
+
+void plRect(real x1, real y1, real x2, real y2, real angDeg)
+{
+  real cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+  real hx = abs(x2 - x1) / 2, hy = abs(y2 - y1) / 2;
+  real a = angDeg * PI / 180.0;
+  real c = cos(a), s = sin(a);
+  plBegin();
+  plRectCorner(cx, cy, -hx, -hy, c, s);
+  plRectCorner(cx, cy,  hx, -hy, c, s);
+  plRectCorner(cx, cy,  hx,  hy, c, s);
+  plRectCorner(cx, cy, -hx,  hy, c, s);
+  plRectCorner(cx, cy, -hx, -hy, c, s);
+  plEnd();
+}
+
 void collectOutline()
 {
   board(B) {
@@ -148,6 +169,9 @@ void collectOutline()
     B.circles(C) {
       if (C.layer == 20 || C.layer == 46) plCircle(u2mm(C.x), u2mm(C.y), u2mm(C.radius));
     }
+    B.rectangles(R) {
+      if (R.layer == 20 || R.layer == 46) plRect(u2mm(R.x1), u2mm(R.y1), u2mm(R.x2), u2mm(R.y2), R.angle);
+    }
     B.elements(E) {
       E.footprint.wires(W) {
         if (W.layer == 20 || W.layer == 46)
@@ -155,6 +179,9 @@ void collectOutline()
       }
       E.footprint.circles(C) {
         if (C.layer == 20 || C.layer == 46) plCircle(u2mm(C.x), u2mm(C.y), u2mm(C.radius));
+      }
+      E.footprint.rectangles(R) {
+        if (R.layer == 20 || R.layer == 46) plRect(u2mm(R.x1), u2mm(R.y1), u2mm(R.x2), u2mm(R.y2), R.angle);
       }
     }
   }
@@ -223,6 +250,50 @@ real loopArea(int l)
     s += LX[s0 + i] * LY[s0 + j] - LX[s0 + j] * LY[s0 + i];
   }
   return s / 2.0;
+}
+
+real BBX0, BBY0, BBX1, BBY1;
+void loopBBox(int l)
+{
+  int i;
+  BBX0 = LX[LOOP_START[l]]; BBX1 = BBX0; BBY0 = LY[LOOP_START[l]]; BBY1 = BBY0;
+  for (i = LOOP_START[l]; i < LOOP_START[l] + LOOP_LEN[l]; i++) {
+    BBX0 = min(BBX0, LX[i]); BBX1 = max(BBX1, LX[i]);
+    BBY0 = min(BBY0, LY[i]); BBY1 = max(BBY1, LY[i]);
+  }
+}
+
+// same shape drawn twice (e.g. on both Dimension and Milling): same bbox and area
+int sameLoop(int a, int b)
+{
+  real ax0, ay0, ax1, ay1, aa, ba;
+  loopBBox(a); ax0 = BBX0; ay0 = BBY0; ax1 = BBX1; ay1 = BBY1;
+  loopBBox(b);
+  if (abs(ax0 - BBX0) > 0.02 || abs(ay0 - BBY0) > 0.02) return 0;
+  if (abs(ax1 - BBX1) > 0.02 || abs(ay1 - BBY1) > 0.02) return 0;
+  aa = abs(loopArea(a)); ba = abs(loopArea(b));
+  if (abs(aa - ba) > 0.02 * max(aa, ba) + 0.001) return 0;
+  return 1;
+}
+
+// distance from (x, y) to the closest edge of loop l
+real distToLoop(real x, real y, int l)
+{
+  int i, j, s0, n;
+  real ax, ay, bx, by, dx, dy, t, d, best = 1e9;
+  s0 = LOOP_START[l]; n = LOOP_LEN[l];
+  for (i = 0; i < n; i++) {
+    j = (i + 1) % n;
+    ax = LX[s0 + i]; ay = LY[s0 + i]; bx = LX[s0 + j]; by = LY[s0 + j];
+    dx = bx - ax; dy = by - ay;
+    t = 0;
+    if (dx * dx + dy * dy > 1e-12) t = ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    d = sqrt((ax + t * dx - x) * (ax + t * dx - x) + (ay + t * dy - y) * (ay + t * dy - y));
+    if (d < best) best = d;
+  }
+  return best;
 }
 
 int pointInLoop(real x, real y, int l)
@@ -1223,11 +1294,17 @@ int outer = 0, l;
 for (l = 1; l < loopCount; l++) if (abs(loopArea(l)) > abs(loopArea(outer))) outer = l;
 addRingFromLoop(outer, 1);
 
-int ignoredLoops = 0;
+int ignoredLoops = 0, dupLoops = 0, cutCount = 0, k, isDup;
+int CUT[];                       // loops used as cutouts
 for (l = 0; l < loopCount; l++) {
   if (l == outer) continue;
-  if (pointInLoop(LX[LOOP_START[l]], LY[LOOP_START[l]], outer)) addRingFromLoop(l, 0);
-  else ignoredLoops++;
+  if (!pointInLoop(LX[LOOP_START[l]], LY[LOOP_START[l]], outer)) { ignoredLoops++; continue; }
+  isDup = 0;
+  for (k = 0; k < cutCount; k++) { if (sameLoop(l, CUT[k])) { isDup = 1; break; } }
+  if (sameLoop(l, outer)) isDup = 1;
+  if (isDup) { dupLoops++; continue; }
+  CUT[cutCount] = l; cutCount++;
+  addRingFromLoop(l, 0);
 }
 
 // SVG bounds from the outer outline (KiCad coords: y down)
@@ -1247,8 +1324,11 @@ collectDrills();
 int dr, rr, okDrill, skippedDrills = 0;
 for (dr = 0; dr < drillCount; dr++) {
   okDrill = pointInLoop(DRX[dr], DRY[dr], outer);
-  for (l = 0; l < loopCount; l++) {
-    if (l != outer && pointInLoop(DRX[dr], DRY[dr], l)) okDrill = 0;
+  if (distToLoop(DRX[dr], DRY[dr], outer) < DRD[dr] / 2 + 0.01) okDrill = 0;   // cuts the board edge
+  for (k = 0; k < cutCount; k++) {
+    l = CUT[k];
+    if (pointInLoop(DRX[dr], DRY[dr], l)) okDrill = 0;                         // inside a cutout
+    if (distToLoop(DRX[dr], DRY[dr], l) < DRD[dr] / 2 + 0.01) okDrill = 0;     // overlaps a cutout edge
   }
   if (okDrill) addDrillRing(DRX[dr], DRY[dr], DRD[dr]);
   else skippedDrills++;
@@ -1322,9 +1402,13 @@ int ok = fileglob(found, gOutPath);
 
 string report, warn;
 sprintf(report, "Board: %d outline points, %d cutouts, %d drill holes, %d triangles, %d pads.",
-        RING_LEN[0], loopCount - 1 - ignoredLoops, drillCount - skippedDrills, triCount, padCount);
+        RING_LEN[0], cutCount, drillCount - skippedDrills, triCount, padCount);
+if (dupLoops > 0) {
+  sprintf(warn, "\n%d outline(s) drawn twice (e.g. on Dimension and Milling) were used once.", dupLoops);
+  report += warn;
+}
 if (openCount > 0 || ignoredLoops > 0 || skippedDrills > 0) {
-  sprintf(warn, "\n\nWarnings: %d open outline segment chain(s), %d outline loop(s) outside the board, %d drill(s) outside the board were ignored.",
+  sprintf(warn, "\n\nWarnings: %d open outline segment chain(s), %d outline loop(s) outside the board, %d drill(s) outside the board or overlapping a cutout were ignored.",
           openCount, ignoredLoops, skippedDrills);
   report += warn;
 }
